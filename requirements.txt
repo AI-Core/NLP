@@ -1,0 +1,11 @@
+jupyter
+torch
+torchvision
+tensorboard
+matplotlib
+plotly
+scipy
+numpy
+tqdm
+torchtext
+spacy
