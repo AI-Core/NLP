@@ -1,1 +1,5 @@
 .ipynb_checkpoints/
+temp/
+2_Seq2Seq/.vector_cache/
+2_Seq2Seq/.data/
+2_Seq2Seq/.ipynb_checkpoints/
