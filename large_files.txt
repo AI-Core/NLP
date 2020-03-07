@@ -1,0 +1,7 @@
+35652319 2_Seq2Seq/checkpoint_best-seq2seq.pt
+19856973 1_WordRepresentations/tokenized_corpus_gutenberg.pkl
+4332554 1_WordRepresentations/gutenberg/bible-kjv.txt
+1690378 1_WordRepresentations/runs/word2vec_gutenberg/00000/default/tensors.tsv
+1674212 1_WordRepresentations/Word Representations.ipynb
+1220066 1_WordRepresentations/gutenberg/melville-moby_dick.txt
+1048240 1_WordRepresentations/glove_50d_TRUNCATED.txt
