@@ -44,7 +44,12 @@ class Embeddings(nn.Module):
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
 
     def forward(self, x):
-        return self.embed(x) * m.sqrt(self.d_model)
+        # shape(x) = [B x seq_len]
+
+        embedding = self.embed(x)
+        # shape(embedding) = [B x seq_len x D]
+
+        return embedding * m.sqrt(self.d_model)
 
 
 class PositionalEncoding(nn.Module):
@@ -68,10 +73,10 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
-        # add constant to embedding
-        seq_len = x.size(1)
-        pe = self.pe[:, :seq_len].detach()
+        # shape(x) = [B x seq_len x D]
+        pe = self.pe[:, :x.shape[1]].detach()
         x = x + pe
+        # shape(x) = [B x seq_len x D]
         return self.dropout(x)
 
 
@@ -82,7 +87,9 @@ class Norm(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        # shape(x) = [B x seq_len x D]
         ln = self.layer_norm(x)
+        # shape(ln) = [B x seq_len x D]
         return self.dropout(ln)
 
 
@@ -98,6 +105,11 @@ class PWFFN(nn.Module):
         )
 
     def forward(self, x):
+        # shape(x) = [B x seq_len x D]
+
+        ff = self.ff(x)
+        # shape(ff) = [B x seq_len x D]
+
         return self.ff(x)
 
 
@@ -123,55 +135,54 @@ class MultiHeadAttention(nn.Module):
         self.mha_linear = nn.Linear(d_model, d_model)
 
     def scaled_dot_product_attention(self, Q: Tensor, K: Tensor, V: Tensor, mask=None):
-        # shape(Q) = [B * num_heads x ??_seq_len x D/num_heads]
-        # shape(K = V (DECODING)) = [B * num_heads x SRC_seq_len x D/num_heads]
-        # shape(mask) = [B * num_heads x TRG_seq_len x TRG_seq_len]
+        # shape(Q) = [B x seq_len (Q) x D/num_heads]
+        # shape(K, V) = [B x seq_len (K, V) x D/num_heads]
 
-        # shape(QK_matmul) = [B * num_heads x ??_seq_len x SRC_seq_len]
-        # shape(QK_matmul) = [B x num_heads x ??_seq_len x SRC_seq_len]
-        Q_K_matmul = torch.matmul(Q, K.transpose(-2, -1))
-        # Q_K_matmul = torch.matmul(Q, K.permute(0, 2, 1))
-        matmul_scaled = Q_K_matmul/m.sqrt(self.d)
+        Q_K_matmul = torch.matmul(Q, K.permute(0, 2, 1))
+        scores = Q_K_matmul/m.sqrt(self.d)
+        # shape(scores) = [B x ??_seq_len x SRC_seq_len]
 
         if mask is not None:
-            ##############
-            # mask = mask.unsqueeze(1)
-            matmul_scaled = matmul_scaled.masked_fill(mask == 0, -1e9)
+            scores = scores.masked_fill(mask == 0, -1e9)
 
-        # shape(attention_weights) = [B * num_heads x ??_seq_len x SRC_seq_len]
-        attention_weights = F.softmax(matmul_scaled, dim=-1)
+        attention_weights = F.softmax(scores, dim=-1)
+        # shape(attention_weights) = [B x seq_len (K, V) x seq_len (Q)]
 
-        # shape(output) = [B * num_heads x ??_seq_len x D/num_heads]
         output = torch.matmul(attention_weights, V)
+        # shape(output) = [B x seq_len (K, V) x D/num_heads]
 
         return output, attention_weights
 
-    def forward(self, q, k, v, mask=None):
+    def forward(self, pre_q, pre_k, pre_v, mask=None):
+        # shape(pre_q (ENCODING)) = [B x SRC_seq_len x D]
+        # shape(pre_q (DECODING)) = [B x TRG_seq_len x D]
+        #
+        # shape(pre_k, pre_v (MASKED ATTENTION)) = [B x TRG_seq_len x D]
+        # shape(pre_k, pre_v (OTHERWISE)) = [B x SRC_seq_len x D]
 
-        # shape(Q) = [B x ??_seq_len x D]
-        # shape(K = V) = IF DECODER: [B x SRC_seq_len x D]
-        # Q = self.linear_Q(q)
-        # K = self.linear_K(k)
-        # V = self.linear_V(v)
+        Q = [linear_Q(pre_q) for linear_Q in self.linear_Qs]
+        K = [linear_K(pre_k) for linear_K in self.linear_Ks]
+        V = [linear_V(pre_v) for linear_V in self.linear_Vs]
+        # shape(Q) = [B x seq_len (Q) x D/num_heads] * num_heads
+        # shape(K) = [B x seq_len (K, V) x D/num_heads] * num_heads
+        # shape(V) = [B x seq_len (K, V) x D/num_heads] * num_heads
 
-        Q = [linear_Q(q) for linear_Q in self.linear_Qs]
-        K = [linear_K(k) for linear_K in self.linear_Ks]
-        V = [linear_V(v) for linear_V in self.linear_Vs]
-
-        batch_size = q.size(0)
-        seq_len = q.size(1)
-
-        scores_per_head = []
-        aw_per_head = []
+        output_per_head = []
+        attn_weights_per_head = []
+        # shape(output_per_head) = [B x seq_len (K, V) x D/num_heads] * num_heads
+        # shape(attn_weights_per_head) = [B x seq_len (K, V) x seq_len (Q)] * num_heads
         for Q_, K_, V_ in zip(Q, K, V):
-            scores, aw = self.scaled_dot_product_attention(Q_, K_, V_, mask)
-            scores_per_head.append(scores)
-            aw_per_head.append(aw)
+            output, attn_weight = self.scaled_dot_product_attention(
+                Q_, K_, V_, mask)
+            output_per_head.append(output)
+            attn_weights_per_head.append(attn_weight)
 
-        scores = torch.cat(scores_per_head, -1)
-        aws = torch.stack(aw_per_head)
+        output = torch.cat(output_per_head, -1)
+        attn_weights = torch.stack(attn_weights_per_head).permute(0, 3, 1, 2)
+        # shape(output) = [B x seq_len (K, V) x D]
+        # shape(attn_weights) = [B x num_heads x seq_len (K, V) x seq_len(Q)]
 
-        return self.mha_linear(self.dropout(scores)), aws
+        return self.mha_linear(self.dropout(output)), attn_weights
 
 
 class EncoderLayer(nn.Module):
@@ -183,13 +194,20 @@ class EncoderLayer(nn.Module):
         self.ff = PWFFN(d_model, d_ff)
 
     def forward(self, x, mask):
-        mha, _ = self.mha(x, x, x, mask)
+        # shape(x) = [B x seq_len x D]
+
+        mha, encoder_attention_weights = self.mha(x, x, x, mask)
         norm1 = self.norm_1(x + mha)
+        # shape(mha) = [B x seq_len x D]
+        # shape(encoder_attention_weights) = [B x num_heads x seq_len x seq_len]
+        # shape(norm1) = [B x seq_len x D]
 
         ff = self.ff(norm1)
         norm2 = self.norm_1(norm1 + ff)
+        # shape(ff) = [B x seq_len x D]
+        # shape(norm2) = [B x seq_len x D]
 
-        return norm2
+        return norm2, encoder_attention_weights
 
 
 class Encoder(nn.Module):
@@ -209,14 +227,19 @@ class Encoder(nn.Module):
         )) for layer in range(num_layers)])
 
     def forward(self, x, mask):
+        # shape(x) = [B x SRC_seq_len]
+
         embeddings = self.Embedding(x)
         encoding = self.PE(embeddings)
+        # shape(embeddings) = [B x SRC_seq_len x D]
+        # shape(encoding) = [B x SRC_seq_len x D]
 
-        # encoding, mask = self.encodersModelStack((encoding, mask))
         for encoder in self.encoders:
-            encoding = encoder(encoding, mask)
+            encoding, encoder_attention_weights = encoder(encoding, mask)
+            # shape(encoding) = [B x SRC_seq_len x D]
+            # shape(encoder_attention_weights) = [B x SRC_seq_len x SRC_seq_len]
 
-        return encoding
+        return encoding, encoder_attention_weights
 
 
 class DecoderLayer(nn.Module):
@@ -230,18 +253,30 @@ class DecoderLayer(nn.Module):
         self.mha_2 = MultiHeadAttention(d_model, num_heads)
         self.ff = PWFFN(d_model, d_ff)
 
-    def forward(self, x, e_outputs, trg_mask, src_mask):
+    def forward(self, x, encoder_outputs, trg_mask, src_mask):
+        # shape(x) = [B x TRG_seq_len x D]
+        # shape(encoder_outputs) = [B x SRC_seq_len x D]
 
         masked_mha, masked_mha_attn_weights = self.mha_1(
             x, x, x, mask=trg_mask)
+        # shape(masked_mha) = [B x TRG_seq_len x D]
+        # shape(masked_mha_attn_weights) = [B x num_heads x TRG_seq_len x TRG_seq_len]
+
         norm1 = self.norm_1(x + masked_mha)
+        # shape(norm1) = [B x TRG_seq_len x D]
 
         enc_dec_mha, enc_dec_mha_attn_weights = self.mha_2(
-            norm1, e_outputs, e_outputs, mask=src_mask)
+            norm1, encoder_outputs, encoder_outputs, mask=src_mask)
+        # shape(enc_dec_mha) = [B x TRG_seq_len x D]
+        # shape(enc_dec_mha_attn_weights) = [B x num_heads x TRG_seq_len x SRC_seq_len]
+
         norm2 = self.norm_2(norm1 + enc_dec_mha)
+        # shape(norm2) = [B x TRG_seq_len x D]
 
         ff = self.ff(norm2)
         norm3 = self.norm_3(norm2 + ff)
+        # shape(ff) = [B x TRG_seq_len x D]
+        # shape(norm3) = [B x TRG_seq_len x D]
 
         return norm3, masked_mha_attn_weights, enc_dec_mha_attn_weights
 
@@ -263,15 +298,18 @@ class Decoder(nn.Module):
         )) for layer in range(num_layers)])
 
     def forward(self, x, encoder_output, trg_mask, src_mask):
-        embeddings = self.Embedding(x)
+        # shape(x) = [B x TRG_seq_len]
 
-        masked_mha_attn_weights = None
-        enc_dec_mha_attn_weights = None
+        embeddings = self.Embedding(x)
+        # shape(embeddings) = [B x TRG_seq_len x D]
 
         encoding = self.PE(embeddings)
         for decoder in self.decoders:
             encoding, masked_mha_attn_weights, enc_dec_mha_attn_weights = decoder(
                 encoding, encoder_output, trg_mask, src_mask)
+            # shape(encoding) = [B x num_heads x TRG_seq_len x SRC_seq_len]
+            # shape(masked_mha_attn_weights) = [B x num_heads x TRG_seq_len x TRG_seq_len]
+            # shape(enc_dec_mha_attn_weights) = [B x num_heads x TRG_seq_len x SRC_seq_len]
 
         return encoding, masked_mha_attn_weights, enc_dec_mha_attn_weights
 
@@ -300,25 +338,34 @@ class Transformer(nn.Module):
 
     def create_src_mask(self, src):
         src_mask = (src != SRC.vocab.stoi["<pad>"]).unsqueeze(-2)
-        # return src_mask.repeat(self.num_heads, 1, 1)
         return src_mask
 
     def create_trg_mask(self, trg):
         trg_mask = (trg != TRG.vocab.stoi["<pad>"]).unsqueeze(-2)
-        size = trg.size(1)  # get seq_len for matrix
+        size = trg.shape[1]  # get seq_len for matrix
         mask = torch.ones((1, size, size)).triu(1).to(device)
         mask = mask == 0
         trg_mask = trg_mask & mask
         return trg_mask
-        # return trg_mask.repeat(self.num_heads, 1, 1)
 
     def forward(self, src, trg):
+        # shape(src) = [B x SRC_seq_len]
+        # shape(trg) = [B x TRG_seq_len]
+
         src_mask = self.create_src_mask(src)
         trg_mask = self.create_trg_mask(trg)
+        # shape(src_mask) = [B x 1 x SRC_seq_len]
+        # shape(trg_mask) = [B x 1 x TRG_seq_len]
 
-        e_outputs = self.encoder(src, src_mask)
-        d_output, _, _ = self.decoder(trg, e_outputs, trg_mask, src_mask)
-        logits = self.linear_layer(d_output)
+        encoder_outputs, encoder_mha_attn_weights = self.encoder(src, src_mask)
+        # shape(encoder_outputs) = [B x SRC_seq_len x D]
+        # shape(encoder_mha_attn_weights) = [B x num_heads x SRC_seq_len x SRC_seq_len]
+        decoder_outputs, _, enc_dec_mha_attn_weights = self.decoder(
+            trg, encoder_outputs, trg_mask, src_mask)
+        # shape(decoder_outputs) = [B x SRC_seq_len x D]
+        # shape(enc_dec_mha_attn_weights) = [B x num_heads x TRG_seq_len x SRC_seq_len]
+        logits = self.linear_layer(decoder_outputs)
+        # shape(logits) = [B x TRG_seq_len x TRG_vocab_size]
 
         return logits
 
