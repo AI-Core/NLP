@@ -1,3 +1,4 @@
+from torch.utils.data import DataLoader, Dataset
 import torch
 from torch import nn
 from torchtext.data import BucketIterator, Field
@@ -14,6 +15,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.tensorboard.writer import SummaryWriter
 from torch import Tensor
+import os
+import sacrebleu
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 if device == "cuda:0":
@@ -203,7 +206,7 @@ class EncoderLayer(nn.Module):
         # shape(norm1) = [B x seq_len x D]
 
         ff = self.ff(norm1)
-        norm2 = self.norm_1(norm1 + ff)
+        norm2 = self.norm_2(norm1 + ff)
         # shape(ff) = [B x seq_len x D]
         # shape(norm2) = [B x seq_len x D]
 
@@ -311,7 +314,7 @@ class Decoder(nn.Module):
             # shape(masked_mha_attn_weights) = [B x num_heads x TRG_seq_len x TRG_seq_len]
             # shape(enc_dec_mha_attn_weights) = [B x num_heads x TRG_seq_len x SRC_seq_len]
 
-        return encoding, masked_mha_attn_weights, enc_dec_mha_attn_weights
+        return encoding, enc_dec_mha_attn_weights, masked_mha_attn_weights
 
 
 class Transformer(nn.Module):
@@ -360,14 +363,14 @@ class Transformer(nn.Module):
         encoder_outputs, encoder_mha_attn_weights = self.encoder(src, src_mask)
         # shape(encoder_outputs) = [B x SRC_seq_len x D]
         # shape(encoder_mha_attn_weights) = [B x num_heads x SRC_seq_len x SRC_seq_len]
-        decoder_outputs, _, enc_dec_mha_attn_weights = self.decoder(
+        decoder_outputs, enc_dec_mha_attn_weights, masked_mha_attn_weights = self.decoder(
             trg, encoder_outputs, trg_mask, src_mask)
         # shape(decoder_outputs) = [B x SRC_seq_len x D]
         # shape(enc_dec_mha_attn_weights) = [B x num_heads x TRG_seq_len x SRC_seq_len]
         logits = self.linear_layer(decoder_outputs)
         # shape(logits) = [B x TRG_seq_len x TRG_vocab_size]
 
-        return logits
+        return logits, encoder_mha_attn_weights, enc_dec_mha_attn_weights, masked_mha_attn_weights
 
 
 def custom_lr_optimizer(optimizer: Adam, step, d_model=hp.D_MODEL, warmup_steps=4000):
@@ -380,7 +383,7 @@ def custom_lr_optimizer(optimizer: Adam, step, d_model=hp.D_MODEL, warmup_steps=
     return optimizer
 
 
-def train(model, SRC, TRG, FORCE_MAX_LEN=50, MODEL_PATH="transformer_model.pt"):
+def train(model, SRC, TRG, MODEL_PATH, FORCE_MAX_LEN=50):
     model.train()
     optimizer = Adam(
         model.parameters(), lr=hp.LR, betas=(0.9, 0.98), eps=1e-9)
@@ -400,7 +403,7 @@ def train(model, SRC, TRG, FORCE_MAX_LEN=50, MODEL_PATH="transformer_model.pt"):
 
             trg_input = trg[:, :-1]
 
-            preds = model(src, trg_input)
+            preds, _, _, _ = model(src, trg_input)
             ys = trg[:, 1:]
 
             loss = criterion(preds.permute(0, 2, 1), ys)
@@ -416,17 +419,11 @@ def train(model, SRC, TRG, FORCE_MAX_LEN=50, MODEL_PATH="transformer_model.pt"):
 
                 v = next(iter(val_iter))
                 v_src, v_trg = v.src.T, v.trg.T
-                if v_src.shape[1] > FORCE_MAX_LEN:
-                    v_src = v_src[:, :FORCE_MAX_LEN]
-                    v_src[:, FORCE_MAX_LEN-1] = SRC.vocab.stoi["<eos>"]
-                if v_trg.shape[1] > FORCE_MAX_LEN:
-                    v_trg = v_trg[:, :FORCE_MAX_LEN]
-                    v_trg[:, FORCE_MAX_LEN-1] = TRG.vocab.stoi["<eos>"]
 
                 v_trg_inp = v_trg[:, :-1].detach()
                 v_trg_real = v_trg[:, 1:].detach()
 
-                v_predictions = model(v_src, v_trg_inp)
+                v_predictions, _, _, _ = model(v_src, v_trg_inp)
                 max_args = v_predictions[rand_index].argmax(-1)
                 print("For random element in VALIDATION batch (real/pred)...")
                 print([TRG.vocab.itos[word_idx]
@@ -457,7 +454,92 @@ def train(model, SRC, TRG, FORCE_MAX_LEN=50, MODEL_PATH="transformer_model.pt"):
         torch.save(model, MODEL_PATH)
 
 
+def search(model, source_sentences, src_sos_idx=SRC.vocab.stoi["<sos>"], trg_sos_idx=TRG.vocab.stoi["<sos>"], max_seq_len=40):
+    src = source_sentences.to(device)
+    # shape(src) = [B x seq_len]
+
+    batch_size = src.shape[0]
+    seq_len = src.shape[1]
+
+    outputs = torch.zeros(batch_size, max_seq_len).long().to(device)
+
+    for seq_id in range(batch_size):
+        input_sequence = src[seq_id].unsqueeze(0)
+        preds = torch.LongTensor([trg_sos_idx]).to(device).unsqueeze(0)
+
+        for t in range(max_seq_len-1):
+            predictions, _, _, _ = transformer(input_sequence, preds)
+            predicted_id = predictions[:, -1:, :].argmax(-1)
+            preds = torch.cat((preds, predicted_id), dim=-1)
+
+        outputs[seq_id] = preds
+
+    return outputs
+
+
+def get_text_from_tensor(tensor, SRC_or_TRG):
+    # shape(tensor) = [B x seq_len]
+    batch_output = []
+
+    sos = SRC_or_TRG.vocab.stoi["<sos>"]
+    eos = SRC_or_TRG.vocab.stoi["<eos>"]
+    pad = SRC_or_TRG.vocab.stoi["<pad>"]
+
+    for i in range(tensor.shape[0]):
+        sequence = tensor[i]
+        words = []
+        for tok_idx in sequence:
+            tok_idx = int(tok_idx)
+            token = SRC_or_TRG.vocab.itos[tok_idx]
+
+            if token == sos:
+                continue
+            elif token == eos or token == pad:
+                break
+            else:
+                words.append(token)
+        words = " ".join(words)
+        batch_output.append(words)
+    return batch_output
+
+
+def evaluate_bleu(model, iterator):
+
+    model.eval()
+
+    hyp = []
+    ref = []
+
+    for batch in tqdm(iterator):
+        src, trg = batch.src.T, batch.trg.T
+        outputs = search(model, src)
+
+        outputs = outputs[:, 1:]
+
+        hyp += get_text_from_tensor(outputs, TRG)
+        ref += get_text_from_tensor(trg, TRG)
+
+    # expand dim of reference list
+    # sys = ['translation_1', 'translation_2']
+    # ref = [['truth_1', 'truth_2'], ['another truth_1', 'another truth_2']]
+    ref = [ref]
+    return sacrebleu.corpus_bleu(hyp, ref, force=True).score
+
+
+def inference(model, source_sentence):
+    source_sentence_tokens = SRC.preprocess(source_sentence)
+    src = SRC.process([source_sentence_tokens]).T
+    outputs = search(model, src)
+    print(get_text_from_tensor(outputs, TRG))
+
+
 if __name__ == "__main__":
-    writer = SummaryWriter()
-    model = Transformer(len(SRC.vocab), len(TRG.vocab)).to(device)
-    train(model, SRC, TRG)
+    MODEL_PATH = "transformer_model.pt"
+    if not os.path.exists(MODEL_PATH):
+        writer = SummaryWriter()
+        transformer = Transformer(len(SRC.vocab), len(TRG.vocab)).to(device)
+        train(transformer, SRC, TRG, MODEL_PATH)
+    else:
+        transformer = torch.load(MODEL_PATH)  # , map_location=device)
+        inference(transformer, "Eine Frau mit blonden Haaren trinkt aus einem Glas")
+        print(evaluate_bleu(transformer, test_iter))
